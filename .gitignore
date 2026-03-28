@@ -1,0 +1,10 @@
+node_modules/
+.next/
+.env.local
+data/pantheon.db
+data/seen-urls.json
+data/test.db
+*.db
+dist/
+.vercel/
+.env

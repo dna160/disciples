@@ -1,0 +1,71 @@
+import { NextResponse } from 'next/server'
+import { prisma } from '@/lib/prisma'
+import { publishToWordPress } from '@/lib/wordpress'
+import { log } from '@/lib/logger'
+
+export async function POST(
+  _req: Request,
+  { params }: { params: { id: string } }
+) {
+  try {
+    const article = await prisma.article.findUnique({ where: { id: params.id } })
+
+    if (!article) {
+      return NextResponse.json({ error: 'Article not found' }, { status: 404 })
+    }
+
+    if (article.status === 'Published') {
+      return NextResponse.json(
+        { error: 'Article is already published' },
+        { status: 409 }
+      )
+    }
+
+    if (article.status === 'Failed') {
+      return NextResponse.json(
+        { error: 'Cannot approve a Failed article' },
+        { status: 422 }
+      )
+    }
+
+    log('info', `[API] Approving article "${article.title}" for publication...`)
+
+    // Embed extra images into content as figure blocks before publishing
+    let publishContent = article.content
+    const extraImgs: string[] = (article as any).images
+      ? JSON.parse((article as any).images)
+      : []
+    if (extraImgs.length > 0) {
+      const figures = extraImgs
+        .map((url) => `<figure class="wp-block-image size-large"><img src="${url}" alt="" /></figure>`)
+        .join('\n')
+      publishContent = publishContent + '\n\n' + figures
+    }
+
+    const wpResult = await publishToWordPress({
+      title: article.title,
+      content: publishContent,
+      brandId: article.brandId,
+      featuredImageUrl: article.featuredImage ?? undefined,
+    })
+
+    const updated = await prisma.article.update({
+      where: { id: params.id },
+      data: {
+        status: 'Published',
+        wpPostId: String(wpResult.id),
+      },
+    })
+
+    log('success', `[API] Article "${article.title}" published — WP ID: ${wpResult.id}`)
+
+    return NextResponse.json({
+      article: updated,
+      wpPostId: wpResult.id,
+      wpLink: wpResult.link,
+    })
+  } catch (err) {
+    log('error', `[API /articles/${params.id}/approve] Error: ${err}`)
+    return NextResponse.json({ error: `Failed to publish article: ${err}` }, { status: 500 })
+  }
+}

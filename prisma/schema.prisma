@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Article {
+  id           String   @id @default(uuid())
+  cycleId      String
+  brandId      String
+  status       String
+  title        String
+  content      String
+  sourceUrl    String?
+  sourceTitle  String?
+  reviewResult  String?
+  wpPostId      String?
+  featuredImage String?
+  images        String?  // JSON: string[] of additional image URLs (index 1+)
+  revisionCount Int     @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Insight {
+  id             String   @id @default(uuid())
+  targetAgent    String
+  suggestionText String
+  status         String   @default("Pending")
+  createdAt      DateTime @default(now())
+}
+
+model SeoDirective {
+  id         String   @id @default(uuid())
+  cycleId    String   @unique
+  directives String   // JSON: InvestigatorDirective[]
+  createdAt  DateTime @default(now())
+}
+
+model Settings {
+  id              String  @id @default("singleton")
+  scrapeFrequency String  @default("4h")
+  requireReview   Boolean @default(false)
+  isLive          Boolean @default(false)
+  targetNiche     String  @default("Indonesian property real estate")
+  nicheA          String  @default("")
+  nicheB          String  @default("")
+  toneA           String  @default("Gen-Z Tech: casual, energetic, emoji-friendly, Indonesian slang")
+  toneB           String  @default("Formal Biz: professional, authoritative, financial focus")
+  rssSourcesA     String  @default("")
+  rssSourcesB     String  @default("")
+  imageCountA     Int     @default(1)
+  imageCountB     Int     @default(1)
+  seoDedupeHours  Int     @default(24)
+  seoShortTail    Int     @default(2)
+  seoEvergreen    Int     @default(1)
+}

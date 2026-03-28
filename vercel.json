@@ -1,0 +1,107 @@
+{
+  "version": 2,
+  "framework": "nextjs",
+  "env": [
+    {
+      "key": "ANTHROPIC_API_KEY",
+      "description": "Anthropic API key for LLM operations",
+      "type": "secret",
+      "required": true
+    },
+    {
+      "key": "DATABASE_URL",
+      "description": "Supabase Postgres connection string",
+      "type": "secret",
+      "required": true
+    },
+    {
+      "key": "WP_URL",
+      "description": "WordPress REST API base URL",
+      "type": "string",
+      "value": "https://your-site.com"
+    },
+    {
+      "key": "WP_USERNAME",
+      "description": "WordPress admin username",
+      "type": "string",
+      "value": "admin"
+    },
+    {
+      "key": "WP_APP_PASSWORD",
+      "description": "WordPress Application Password",
+      "type": "secret",
+      "required": true
+    }
+  ],
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "installCommand": "npm ci",
+  "middleware": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    }
+  ],
+  "functions": {
+    "api/process-news/route.ts": {
+      "memory": 1024,
+      "maxDuration": 60
+    },
+    "api/articles/route.ts": {
+      "memory": 512,
+      "maxDuration": 30
+    },
+    "api/insights/route.ts": {
+      "memory": 512,
+      "maxDuration": 30
+    },
+    "api/stream/route.ts": {
+      "memory": 512,
+      "maxDuration": 900
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/process-news",
+      "schedule": "*/10 * * * *"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "*"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, PUT, DELETE, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Authorization"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "SAMEORIGIN"
+        },
+        {
+          "key": "X-XSS-Protection",
+          "value": "1; mode=block"
+        }
+      ]
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/health",
+      "destination": "/api/health",
+      "permanent": false
+    }
+  ]
+}
