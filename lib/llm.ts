@@ -198,12 +198,12 @@ export async function reviewArticle(
   draft: string,
   sourceText: string,
   signal?: AbortSignal
-): Promise<{ status: 'PASS' | 'FAIL'; reason: string }> {
+): Promise<{ status: 'PASS' | 'FAIL'; reason: string; incompleteInfo: boolean }> {
   try {
-    const parsed = await withRetry<{ status: 'PASS' | 'FAIL'; reason: string }>(async () => {
+    const parsed = await withRetry<{ status: 'PASS' | 'FAIL'; reason: string; incompleteInfo: boolean }>(async () => {
       const response = await getClient().messages.create({
         model: MODEL,
-        max_tokens: 256,
+        max_tokens: 300,
         temperature: 0.0,
         messages: [
           {
@@ -212,14 +212,18 @@ export async function reviewArticle(
 
 Check for:
 1. Factual accuracy — does the draft accurately represent the source?
-2. No hallucinated facts, statistics, or quotes not present in the source
+2. No hallucinated facts, statistics, quotes, or names not present in the source
 3. No defamatory or legally risky statements
 4. Appropriate journalistic tone
+5. Incomplete information — set incompleteInfo to true if:
+   (a) The draft contains specific facts, figures, or claims that appear to be hallucinated (invented, not in source), OR
+   (b) The source material is too thin to adequately cover the topic (fewer than ~150 words of usable content, or lacks the key facts needed for a complete article)
 
 Respond ONLY with valid JSON in this format:
 {
   "status": "PASS" or "FAIL",
-  "reason": "Brief explanation of decision"
+  "reason": "Brief explanation of decision",
+  "incompleteInfo": true or false
 }
 
 SOURCE MATERIAL:
@@ -234,11 +238,13 @@ Respond ONLY with the JSON object.`,
       }, { signal })
       const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
       const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
-      return JSON.parse(jsonText) as { status: 'PASS' | 'FAIL'; reason: string }
+      const result = JSON.parse(jsonText) as { status: 'PASS' | 'FAIL'; reason: string; incompleteInfo: boolean }
+      if (typeof result.incompleteInfo !== 'boolean') result.incompleteInfo = false
+      return result
     }, signal)
 
     if (parsed.status === 'FAIL') {
-      log('error', `[EDITOR] REJECTED: ${parsed.reason}`)
+      log('error', `[EDITOR] REJECTED: ${parsed.reason}${parsed.incompleteInfo ? ' [INCOMPLETE INFO]' : ''}`)
     } else {
       log('success', '[EDITOR] APPROVED for publication.')
     }
@@ -250,7 +256,7 @@ Respond ONLY with the JSON object.`,
   } catch (err) {
     if (signal?.aborted) throw err
     log('error', `[LLM] reviewArticle failed: ${err}`)
-    return { status: 'FAIL', reason: `Review system error: ${err}` }
+    return { status: 'FAIL', reason: `Review system error: ${err}`, incompleteInfo: false }
   }
 }
 

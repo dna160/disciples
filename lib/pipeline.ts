@@ -22,6 +22,7 @@ import { publishToInstagram, isInstagramConfigured } from './instagram'
 import { resolveItemImages, searchReplacementImage } from './image-resolver'
 import { generateSeoDirectives, generateReplacementDirective, type InvestigatorDirective } from './seo-strategist'
 import { searchMultiple } from './searcher'
+import { scrapeArticleContent } from './article-scraper'
 
 // Base brands — niche & tone overrides are loaded per cycle from Settings
 const BASE_BRANDS = [
@@ -330,6 +331,8 @@ async function runEditorWorker(
   isDone: () => boolean,
   settings: ExtendedSettings,
   brandNiches: Record<string, string>,
+  seenDirectiveKeys: Set<string>,
+  draftCounter: { done: number; total: number },
 ): Promise<void> {
   const MAX_REVISIONS = 5
   const label = `[${editorId.toUpperCase()}]`
@@ -362,6 +365,155 @@ async function runEditorWorker(
       log('success', `${label} PASS (1st, image OK): "${article.title}" (${article.brandId})`)
       updateAgentTask(editorId, taskId, 'done')
       continue
+    }
+
+    // ── Incomplete information: re-investigate or replace topic ───────
+    if (firstReview.incompleteInfo) {
+      log('warn', `${label} [INCOMPLETE INFO] "${article.title}" — ${firstReview.reason}`)
+      const incBrand = BASE_BRANDS.find((b) => b.id === article.brandId)
+
+      if (incBrand) {
+        const toneOvInc = settings[incBrand.settingsToneKey]?.trim()
+        const guidelinesInc = toneOvInc
+          ? toneOvInc + '\n\nWrite a complete news article in JSON format: {"title":"...","content":"..."}'
+          : BRAND_GUIDELINES[incBrand.id]
+
+        // Step 1: Try to scrape richer content from the original source URL
+        const sourceUrl = (article as any).sourceUrl as string | null
+        let reinvestigated = false
+
+        if (sourceUrl) {
+          log('info', `${label} Re-investigating: scraping full content from ${sourceUrl.slice(0, 80)}`)
+          addAgentTask('investigator', `Re-scrape: "${article.title.slice(0, 45)}"`)
+          const scraped = await scrapeArticleContent(sourceUrl, pipelineAbortController?.signal)
+          const originalLen = (articleSourceMap[articleId] || article.content).length
+
+          if (scraped.content.length > originalLen + 200) {
+            const enrichedSource = (articleSourceMap[articleId] || '') + '\n\n[Full article content]:\n' + scraped.content
+            articleSourceMap[articleId] = enrichedSource
+
+            log('info', `${label} Re-drafting with richer source (${scraped.pagesScraped} page(s), ${scraped.content.length} chars)`)
+            const reDraft = await draftArticle(enrichedSource, article.brandId, guidelinesInc, pipelineAbortController?.signal)
+            await prisma.article.update({ where: { id: articleId }, data: { title: reDraft.title, content: reDraft.content } })
+
+            const reReview = await reviewArticle(reDraft.content, enrichedSource, pipelineAbortController?.signal)
+
+            if (reReview.status === 'PASS') {
+              await prisma.article.update({ where: { id: articleId }, data: { reviewResult: JSON.stringify(reReview) } })
+              await runImageReview(articleId, reDraft.title, enrichedSource)
+              results.firstPassIds.push(articleId)
+              results.allPassedIds.push(articleId)
+              log('success', `${label} PASS after re-investigation: "${reDraft.title}"`)
+              updateAgentTask(editorId, taskId, 'done')
+              reinvestigated = true
+            } else if (!reReview.incompleteInfo) {
+              // Source is now adequate — fall into normal revision loop with enriched content
+              log('info', `${label} Re-draft FAIL (non-incomplete) — passing to revision loop with enriched source`)
+              updateAgentTask(editorId, taskId, 'done')
+              reinvestigated = true
+              // Fall through intentionally — the revision loop below will pick up
+              // the enriched articleSourceMap and the re-drafted content already in DB
+            }
+            // If still incompleteInfo: fall through to replacement below
+          }
+        }
+
+        if (!reinvestigated) {
+          // Step 2: Source is insufficient — request replacement topic from SEO Strategist
+          log('warn', `${label} Source insufficient even after scraping — requesting replacement topic`)
+          addAgentTask('investigator', `Replacement needed: "${article.title.slice(0, 40)}"`)
+
+          const brandNicheForRepl = brandNiches[article.brandId] ?? settings.targetNiche
+          const avoidTopics = [(article as any).sourceTitle ?? article.title]
+
+          const replacementDir = await generateReplacementDirective(
+            article.brandId,
+            brandNicheForRepl,
+            'short-tail',
+            avoidTopics,
+            pipelineAbortController?.signal
+          )
+
+          if (replacementDir) {
+            const replKey = replacementDir.target_keyword
+
+            // Dedup: check against recently published
+            const recentCutoff = new Date(Date.now() - (settings.investigatorDedupeHours ?? 24) * 60 * 60 * 1000).toISOString()
+            const recentRows = await prisma.$queryRawUnsafe<Array<{ title: string }>>(
+              `SELECT title FROM "Article" WHERE brandId = ? AND createdAt >= ? AND status = 'Published' ORDER BY createdAt DESC LIMIT 30`,
+              article.brandId, recentCutoff
+            )
+            const recentHeadlines = recentRows.map((r) => r.title).filter(Boolean)
+            const keepList = await filterDirectivesAgainstPublished(
+              [{ keyword: replKey, type: replacementDir.topic_type, angle: replacementDir.angle }],
+              recentHeadlines,
+              pipelineAbortController?.signal
+            )
+
+            if (keepList.includes(replKey) && !seenDirectiveKeys.has(replKey)) {
+              seenDirectiveKeys.add(replKey)
+
+              // Search for replacement content via Serper (if configured)
+              let replSourceText = `Topic: ${replKey}\nAngle: ${replacementDir.angle}`
+              if (process.env.SERPER_API_KEY) {
+                const hits = await searchMultiple(replacementDir.suggested_search_queries, 3)
+                if (hits.length > 0) {
+                  replSourceText = hits.map((h) => `${h.title}\n${h.snippet}`).join('\n\n')
+                }
+              }
+
+              // Create + draft replacement article
+              draftCounter.total++
+              const replArticle = await prisma.article.create({
+                data: {
+                  id: uuidv4(),
+                  cycleId: article.cycleId,
+                  brandId: article.brandId,
+                  status: 'Drafting',
+                  title: `[Drafting] ${replKey}`,
+                  content: '',
+                  sourceUrl: '',
+                  sourceTitle: replKey,
+                  featuredImage: null,
+                },
+              })
+
+              const replDraft = await draftArticle(replSourceText, article.brandId, guidelinesInc, pipelineAbortController?.signal)
+              await prisma.article.update({
+                where: { id: replArticle.id },
+                data: { title: replDraft.title, content: replDraft.content, status: 'Pending Review' },
+              })
+              articleSourceMap[replArticle.id] = replSourceText
+              queue.push(replArticle.id)
+              draftCounter.done++
+
+              log('success', `${label} Replacement article queued: "${replDraft.title}"`)
+            } else {
+              log('warn', `${label} Replacement "${replKey}" already covered or queued — skipping`)
+            }
+          } else {
+            log('warn', `${label} No replacement directive generated for "${article.brandId}"`)
+          }
+
+          // Mark original as Failed
+          await prisma.article.update({
+            where: { id: articleId },
+            data: { status: 'Failed', reviewResult: JSON.stringify({ ...firstReview, reason: 'Source insufficient — replacement queued' }) },
+          })
+          log('warn', `${label} Original article marked Failed (source insufficient): "${article.title}"`)
+          updateAgentTask(editorId, taskId, 'failed')
+          continue
+        }
+
+        // If reinvestigated but still needs revision, skip the incompleteInfo guard and fall through
+        if (reinvestigated) {
+          // Re-read from DB to get current title/content after re-draft
+          const refreshed = await prisma.article.findUnique({ where: { id: articleId } })
+          if (!refreshed) { updateAgentTask(editorId, taskId, 'failed'); continue }
+          // Only continue to revision loop if article is still in a reviewable state
+          // (re-draft passed → already continued above; only reach here on non-incompleteInfo FAIL)
+        }
+      }
     }
 
     // ── Revision loop ──────────────────────────────────────────────
@@ -905,12 +1057,11 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
 
     const articleSourceMap: Record<string, string> = {}
     const editorQueue: string[] = []
-    let draftsDone = 0
-    let draftsTotal = 0
+    const draftCounter = { done: 0, total: 0 }
 
     // Count total expected drafts
     for (const item of cappedItems) {
-      draftsTotal += BASE_BRANDS.filter((b) => (itemBrandRelevance[item.link] ?? []).includes(b.id)).length
+      draftCounter.total += BASE_BRANDS.filter((b) => (itemBrandRelevance[item.link] ?? []).includes(b.id)).length
     }
 
     const editorResultStore = {
@@ -927,9 +1078,11 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
         editorQueue,
         articleSourceMap,
         editorResultStore,
-        () => draftsDone >= draftsTotal,
+        () => draftCounter.done >= draftCounter.total,
         settings,
         brandNiches,
+        seenDirectiveKeys,
+        draftCounter,
       )
     )
 
@@ -995,7 +1148,7 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
             // Register source text and push to editor queue immediately
             articleSourceMap[articleId] = fullSourceText
             editorQueue.push(articleId)
-            draftsDone++
+            draftCounter.done++
 
             // Log least-busy editor for visibility
             const editorLoads = ['editor', 'editor-b', 'editor-c'].map((eid) => ({
