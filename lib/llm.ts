@@ -28,6 +28,7 @@ const MODEL = 'claude-haiku-4-5-20251001'
 // ── Retry helpers ─────────────────────────────────────────────────────────────
 const RETRY_MAX_ATTEMPTS = 5
 const RETRY_BASE_DELAY_MS = 10_000
+const JSON_RETRY_DELAY_MS = 5_000
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -43,6 +44,9 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+// Retries fn() on:
+//   - HTTP 429 / RateLimitError → exponential backoff (10s, 20s, 40s, 80s)
+//   - SyntaxError (bad JSON from LLM) → fixed 5s delay, re-calls the LLM
 export async function withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   let attempt = 0
   while (true) {
@@ -54,35 +58,12 @@ export async function withRetry<T>(fn: () => Promise<T>, signal?: AbortSignal): 
         err instanceof Anthropic.RateLimitError ||
         (err instanceof Anthropic.APIError && err.status === 429) ||
         (typeof err === 'object' && err !== null && (err as { status?: number }).status === 429)
+      const isJsonError = err instanceof SyntaxError
       attempt++
-      if (!isRateLimit || attempt >= RETRY_MAX_ATTEMPTS) throw err
-      const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
-      log('warn', `[LLM] Rate limit hit — attempt ${attempt}/${RETRY_MAX_ATTEMPTS}. Retrying in ${delayMs / 1000}s...`)
-      await sleep(delayMs, signal)
-    }
-  }
-}
-
-// ── JSON parse error retry ────────────────────────────────────────────────────────
-const JSON_PARSE_MAX_ATTEMPTS = 3
-const JSON_PARSE_DELAY_MS = 5_000
-
-export async function parseJsonWithRetry<T>(
-  text: string,
-  signal?: AbortSignal,
-  onRetry?: (attempt: number) => void
-): Promise<T> {
-  let attempt = 0
-  while (true) {
-    try {
-      return JSON.parse(text) as T
-    } catch (err) {
-      if (signal?.aborted) throw err
-      attempt++
-      if (attempt >= JSON_PARSE_MAX_ATTEMPTS) throw err
-      const delayMs = JSON_PARSE_DELAY_MS
-      log('warn', `[LLM] JSON parse error — attempt ${attempt}/${JSON_PARSE_MAX_ATTEMPTS}. Retrying in ${delayMs / 1000}s...`)
-      onRetry?.(attempt)
+      if ((!isRateLimit && !isJsonError) || attempt >= RETRY_MAX_ATTEMPTS) throw err
+      const delayMs = isRateLimit ? RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1) : JSON_RETRY_DELAY_MS
+      const label = isRateLimit ? 'Rate limit' : 'JSON parse error'
+      log('warn', `[LLM] ${label} — attempt ${attempt}/${RETRY_MAX_ATTEMPTS}. Retrying in ${delayMs / 1000}s...`)
       await sleep(delayMs, signal)
     }
   }
@@ -167,14 +148,15 @@ export async function draftArticle(
   signal?: AbortSignal
 ): Promise<{ title: string; content: string }> {
   try {
-    const response = await withRetry(() => getClient().messages.create({
-      model: MODEL,
-      max_tokens: 1024,
-      temperature: 0.7,
-      messages: [
-        {
-          role: 'user',
-          content: `${brandGuidelines}
+    const parsed = await withRetry<{ title: string; content: string }>(async () => {
+      const response = await getClient().messages.create({
+        model: MODEL,
+        max_tokens: 1024,
+        temperature: 0.7,
+        messages: [
+          {
+            role: 'user',
+            content: `${brandGuidelines}
 
 Based on the following source material, write a complete news article. MONITOR SOURCE ADHERENCE STRICTLY: Do not add quotes, names, or dates not in the source. You MUST respond with valid JSON only in this exact format:
 {
@@ -186,22 +168,13 @@ Source material:
 ${rawText}
 
 Respond ONLY with the JSON object. No preamble, no explanation.`,
-        },
-      ],
-    }, { signal }), signal)
-
-    const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
-
-    // Strip markdown code fences if present
-    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
-
-    const parsed = await parseJsonWithRetry<{ title: string; content: string }>(
-      jsonText,
-      signal,
-      (attempt) => {
-        log('warn', `[COPYWRITER] Draft JSON parse error (attempt ${attempt}), re-requesting...`)
-      }
-    )
+          },
+        ],
+      }, { signal })
+      const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
+      const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+      return JSON.parse(jsonText) as { title: string; content: string }
+    }, signal)
     if (!parsed.title || !parsed.content) {
       throw new Error('Invalid draft response: missing title or content')
     }
@@ -209,7 +182,6 @@ Respond ONLY with the JSON object. No preamble, no explanation.`,
   } catch (err) {
     if (signal?.aborted) throw err
     log('error', `[LLM] draftArticle failed for brand "${brandId}": ${err}`)
-    // Return a fallback so pipeline can continue
     return {
       title: `[Draft Failed] Article for ${brandId}`,
       content: `Article generation failed. Source text was:\n\n${rawText.slice(0, 200)}...`,
@@ -228,14 +200,15 @@ export async function reviewArticle(
   signal?: AbortSignal
 ): Promise<{ status: 'PASS' | 'FAIL'; reason: string }> {
   try {
-    const response = await withRetry(() => getClient().messages.create({
-      model: MODEL,
-      max_tokens: 256,
-      temperature: 0.0,
-      messages: [
-        {
-          role: 'user',
-          content: `You are an editorial compliance officer. Review the following drafted article against its source material.
+    const parsed = await withRetry<{ status: 'PASS' | 'FAIL'; reason: string }>(async () => {
+      const response = await getClient().messages.create({
+        model: MODEL,
+        max_tokens: 256,
+        temperature: 0.0,
+        messages: [
+          {
+            role: 'user',
+            content: `You are an editorial compliance officer. Review the following drafted article against its source material.
 
 Check for:
 1. Factual accuracy — does the draft accurately represent the source?
@@ -256,19 +229,13 @@ DRAFTED ARTICLE:
 ${draft}
 
 Respond ONLY with the JSON object.`,
-        },
-      ],
-    }, { signal }), signal)
-
-    const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
-    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
-    const parsed = await parseJsonWithRetry<{ status: 'PASS' | 'FAIL'; reason: string }>(
-      jsonText,
-      signal,
-      (attempt) => {
-        log('warn', `[EDITOR] Review JSON parse error (attempt ${attempt}), re-requesting...`)
-      }
-    )
+          },
+        ],
+      }, { signal })
+      const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
+      const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+      return JSON.parse(jsonText) as { status: 'PASS' | 'FAIL'; reason: string }
+    }, signal)
 
     if (parsed.status === 'FAIL') {
       log('error', `[EDITOR] REJECTED: ${parsed.reason}`)
@@ -581,14 +548,15 @@ export async function reviseArticle(
   signal?: AbortSignal
 ): Promise<{ title: string; content: string }> {
   try {
-    const response = await withRetry(() => getClient().messages.create({
-      model: MODEL,
-      max_tokens: 1024,
-      temperature: 0.5,
-      messages: [
-        {
-          role: 'user',
-          content: `${brandGuidelines}
+    const parsed = await withRetry<{ title: string; content: string }>(async () => {
+      const response = await getClient().messages.create({
+        model: MODEL,
+        max_tokens: 1024,
+        temperature: 0.5,
+        messages: [
+          {
+            role: 'user',
+            content: `${brandGuidelines}
 
 You previously wrote the following article draft. The editor-in-chief has reviewed it and flagged specific issues. Your task is to REVISE the existing draft to fix ALL of the listed issues while keeping the article grounded in the source material.
 
@@ -609,19 +577,13 @@ Respond ONLY with valid JSON in this exact format:
 }
 
 No preamble, no explanation.`,
-        },
-      ],
-    }, { signal }), signal)
-
-    const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
-    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
-    const parsed = await parseJsonWithRetry<{ title: string; content: string }>(
-      jsonText,
-      signal,
-      (attempt) => {
-        log('warn', `[COPYWRITER] Revision JSON parse error (attempt ${attempt}), re-requesting...`)
-      }
-    )
+          },
+        ],
+      }, { signal })
+      const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
+      const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+      return JSON.parse(jsonText) as { title: string; content: string }
+    }, signal)
     if (!parsed.title || !parsed.content) {
       throw new Error('Invalid revision response: missing title or content')
     }
