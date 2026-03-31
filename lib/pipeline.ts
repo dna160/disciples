@@ -8,7 +8,6 @@ import {
   draftArticle,
   reviseArticle,
   reviewArticle,
-  reviewImage,
   generateCopywriterFeedback,
   generateInvestigatorFeedback,
   detectTopicConcentration,
@@ -19,7 +18,7 @@ import {
 import { publishToWordPress } from './wordpress'
 import { generateSocialPost } from './social-media'
 import { publishToInstagram, isInstagramConfigured } from './instagram'
-import { resolveItemImages, searchReplacementImage } from './image-resolver'
+import { resolveItemImages, searchReplacementImage, reviewImageWithFallback } from './image-resolver'
 import { generateSeoDirectives, generateReplacementDirective, type InvestigatorDirective } from './seo-strategist'
 import { searchMultiple } from './searcher'
 import { scrapeArticleContent } from './article-scraper'
@@ -355,7 +354,7 @@ async function runImageReview(articleId: string, articleTitle: string, sourceTex
   const triedUrls = new Set<string>(currentImages)
 
   for (const url of currentImages) {
-    const review = await reviewImage(url, articleTitle, sourceText, pipelineAbortController?.signal)
+    const review = await reviewImageWithFallback(url, articleTitle, sourceText, pipelineAbortController?.signal)
     if (review.status === 'PASS') {
       passedImages.push(url)
       if (passedImages.length === targetImageCount) break
@@ -376,7 +375,7 @@ async function runImageReview(articleId: string, articleTitle: string, sourceTex
     for (const newUrl of replacements) {
       if (triedUrls.has(newUrl)) continue
       triedUrls.add(newUrl)
-      const review = await reviewImage(newUrl, articleTitle, sourceText, pipelineAbortController?.signal)
+      const review = await reviewImageWithFallback(newUrl, articleTitle, sourceText, pipelineAbortController?.signal)
       if (review.status === 'PASS') {
         passedImages.push(newUrl)
         log('success', `[EDITOR] Replacement image APPROVED. (${passedImages.length}/${targetImageCount})`)
@@ -1284,11 +1283,31 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
     checkAbort()
     log('info', '[ROUTER] Running franchise deduplication on passed items...')
     const maxPerFranchise = settings.investigatorMaxSameFranchise ?? 1
-    const keepIds = await deduplicateByFranchise(
+    let keepIds = await deduplicateByFranchise(
       relevantItems.map((item) => ({ id: item.link, title: item.title, summary: item.summary })),
       pipelineAbortController?.signal,
       maxPerFranchise
     )
+
+    // FIX: Safety fallback — if the LLM-based dedup returns 0 keep IDs while there
+    // are valid candidates (e.g. LLM returned unexpected JSON or franchise field was
+    // missing), bypass the dedup and pass all items so the pipeline is never stalled.
+    if (keepIds.length === 0 && relevantItems.length > 0) {
+      log('warn', '[ROUTER] Franchise dedup returned 0 items — LLM may have dropped all due to missing franchise field. Falling back to title-based dedup (pass-through).')
+      // Lightweight client-side fallback: deduplicate by normalized title prefix so at
+      // least obvious duplicates are still caught without requiring an LLM call.
+      const seenTitleKeys = new Set<string>()
+      keepIds = relevantItems
+        .filter((item) => {
+          const key = item.title.toLowerCase().replace(/\s+/g, '-').slice(0, 60)
+          if (seenTitleKeys.has(key)) return false
+          seenTitleKeys.add(key)
+          return true
+        })
+        .map((item) => item.link)
+      log('info', `[ROUTER] Title-based fallback dedup kept ${keepIds.length}/${relevantItems.length} items`)
+    }
+
     const dedupedItems = relevantItems.filter((item) => keepIds.includes(item.link))
     const removedCount = relevantItems.length - dedupedItems.length
     if (removedCount > 0) {
@@ -1297,7 +1316,7 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
         .map((item) => `"${item.title}"`)
       log('warn', `[ROUTER] Franchise dedup removed ${removedCount} duplicate(s): ${removedTitles.join(', ')}`)
     }
-    log('info', `[ROUTER] ${dedupedItems.length} unique-franchise items proceeding to copywriters`)
+    log('info', `[INFO ][ROUTER] ${dedupedItems.length} unique-franchise items proceeding to copywriters`)
 
     // ── Directive slot enforcement ─────────────────────────────────────────────
     // Each SEO directive should produce exactly 1 article. After franchise dedup

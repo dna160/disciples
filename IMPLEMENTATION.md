@@ -10,6 +10,78 @@
 
 ---
 
+### v1.9.0 — Pipeline Router Franchise Fix & Dedup Safety Fallback
+**Date:** 2026-03-31
+**Branch:** `master`
+
+#### Summary
+Fixes a critical bug where the pipeline router dropped **all** items to 0 after franchise deduplication. Root cause: the `generateDistributedTopics` quota loop prompt did not ask the LLM to output a `franchise` field, causing `deduplicateByFranchise` to receive items with no franchise identity and silently discard the entire batch. Two coordinated fixes applied.
+
+---
+
+#### Fix 1: `franchise` Field Added to Quota Prompt Output (`lib/seo-strategist.ts`)
+
+**Problem:** The `generateDistributedTopics` per-slot prompt returned `{ title, focus_keyword, reasoning }` — no `franchise`. The router's `deduplicateByFranchise` LLM call could not group articles by IP and dropped everything.
+
+**Fix:** Added `franchise` to:
+- `DistributedTopic` interface (new required field `franchise: string`)
+- The per-slot LLM prompt JSON schema — the LLM is now explicitly instructed to name the IP (e.g. `"Jujutsu Kaisen"`, `"Gundam"`, `"Hololive"`) or `"General"` if no specific IP applies
+- The `parsed` type cast (`franchise?: string`)
+- The `generatedTopics.push()` — with in-code fallback `parsed.franchise || parsed.focus_keyword || 'general'` so the field is never empty even if the LLM omits it
+
+**Files changed:** `lib/seo-strategist.ts`
+
+---
+
+#### Fix 2: Router Safety Fallback (`lib/pipeline.ts`)
+
+**Problem:** If `deduplicateByFranchise` (LLM-based) returned 0 `keepIds` for any reason (LLM JSON failure, missing franchise field, unexpected output), the entire batch of valid items was silently discarded — pipeline produced 0 articles.
+
+**Fix:** After the `deduplicateByFranchise` call, a guard checks `keepIds.length === 0 && relevantItems.length > 0`. When triggered:
+1. Logs a `[WARN]` identifying the franchise-dedup failure.
+2. Runs a lightweight **client-side title-based dedup** (normalized 60-char title prefix, no LLM required) as the fallback.
+3. Pipeline continues with those items rather than producing zero output.
+
+The final log line was also updated to `[INFO ][ROUTER] N unique-franchise items proceeding to copywriters` to match the format referenced in the user's monitoring setup.
+
+**Files changed:** `lib/pipeline.ts` (franchise dedup block, lines ~1283–1317)
+
+---
+
+### v1.8.0 — Google Trends Real-Time Integration
+**Date:** 2026-03-31
+**Branch:** `master`
+
+#### Summary
+Injects live Google Trends data into the SEO Strategist discovery pipeline, eliminating stale-news hallucination for short-tail directives. The Trends feed is fetched once per pipeline cycle via Google's RSS endpoint and rendered directly into the strategist's context window alongside the existing dedup and avoid-topic blocks.
+
+---
+
+#### Feature: `getRealTimeTrends()` — Google Trends RSS Fetcher (`lib/seo-strategist.ts`)
+
+**Problem:** The SEO Strategist relied solely on the LLM's internal training knowledge to identify "trending" short-tail topics, which caused it to hallucinate dated events (e.g. 2023 anime season finales) as if they were current.
+
+**Fix:** Added `getRealTimeTrends(countryCode, limit)` using the `rss-parser` package (already a project dependency). It fetches `https://trends.google.com/trending/rss?geo={countryCode}` and extracts the `<ht:approx_traffic>` custom XML field from each item.
+
+**Limit is dynamic:** The `limit` parameter is computed as `Math.max(5, totalExpected)` where `totalExpected = (shortTailPerBrand + evergreenPerBrand) × 5`. This ensures the number of trend signals scales with the pipeline's configured directive quota — e.g. a `2+1` config fetches 15 signals; a `1+1` config fetches 10.
+
+**New exports from `lib/seo-strategist.ts`:**
+
+| Symbol | Kind | Description |
+|---|---|---|
+| `TrendingTopic` | interface | `{ keyword: string, traffic: string, newsList: string }` |
+| `getRealTimeTrends(countryCode?, limit?)` | async function | Fetch live trending topics from Google Trends RSS |
+
+**Prompt injection:** `buildStrategistPrompt()` renders a numbered `📈 REAL-TIME GOOGLE TRENDS` block. Each entry shows rank, keyword, estimated traffic, and a 120-char news context snippet.
+
+**Stale-news guardrail:** Added a `⚠️ NO STALE NEWS RULE` paragraph at the top of the strategist system prompt, explicitly forbidding topics about past-year events.
+
+**Failure mode:** `getRealTimeTrends()` returns `[]` on any network error — the pipeline never hard-fails on a failed Trends fetch. The `📈` block is omitted from the prompt when the array is empty.
+
+**Files changed:** `lib/seo-strategist.ts`
+
+---
+
 ### v1.7.0 — Featured Image Binary Upload & Markdown Safety-Net
 **Date:** 2026-03-31
 **Branch:** `master`
@@ -538,6 +610,9 @@ interface Settings {
   seoDedupeHours, seoShortTail, seoEvergreen,
   investigatorDedupeHours, investigatorMaxSameFranchise
 }
+
+interface TrendingTopic { keyword: string, traffic: string, newsList: string }
+// Exported from lib/seo-strategist.ts — represents one Google Trends RSS item
 ```
 
 ---
@@ -593,6 +668,7 @@ interface Settings {
 | `publishToWordPress` | `lib/wordpress.ts` | Create WP post |
 | `updateWordPressPost` | `lib/wordpress.ts` | Update existing WP post |
 | `generateSeoDirectives` | `lib/seo-strategist.ts` | Generate `InvestigatorDirective[]` for cycle |
+| `getRealTimeTrends` | `lib/seo-strategist.ts` | Fetch live trending topics from Google Trends RSS → `TrendingTopic[]` |
 | `generateReplacementDirective` | `lib/seo-strategist.ts` | Replace one directive when topic over-concentrates |
 | `startScheduler` / `stopScheduler` | `lib/scheduler.ts` | Cron auto-run control |
 | `log` | `lib/logger.ts` | Emit log to SSE stream + terminal UI |
