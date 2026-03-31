@@ -51,6 +51,29 @@ interface WPPublishResult {
 
 type WPBackend = 'mock' | 'wpcom' | 'selfhosted'
 
+// ── Brand → WordPress Category mapping ───────────────────────────────────────
+// Category IDs sourced from https://hotpink-dogfish-392833.hostingersite.com
+// /wp-json/wp/v2/categories — verified 2026-03-31
+// To refresh: GET /wp-json/wp/v2/categories?per_page=50
+const BRAND_CATEGORY_ID: Record<string, number> = {
+  'anime':        11,  // Anime
+  'toys':         12,  // Toys
+  'infotainment': 10,  // Infotainment
+  'game':         13,  // Game
+  'comic':        14,  // Comic
+  'event':        17,  // Event
+}
+
+// Slug names for the wpcom v1.1 API (which takes category slugs, not IDs)
+const BRAND_CATEGORY_SLUG: Record<string, string> = {
+  'anime':        'anime',
+  'toys':         'toys',
+  'infotainment': 'infotainment',
+  'game':         'game',
+  'comic':        'comic',
+  'event':        'event',
+}
+
 function getWPCredentials(): {
   postsEndpoint: string
   updateEndpoint: (postId: string) => string
@@ -141,6 +164,10 @@ export async function publishToWordPress(article: {
 }): Promise<WPPublishResult> {
   const { postsEndpoint, authHeader, backend } = getWPCredentials()
 
+  // Resolve category for this brand
+  const categoryId   = BRAND_CATEGORY_ID[article.brandId]   ?? 1   // fallback: Uncategorized
+  const categorySlug = BRAND_CATEGORY_SLUG[article.brandId] ?? 'uncategorized'
+
   const payload: Record<string, unknown> = {
     title: article.title,
     content: article.content,
@@ -148,19 +175,23 @@ export async function publishToWordPress(article: {
   }
 
   if (backend === 'wpcom') {
-    // v1.1 API: upload image to media library first, then set featured_image by ID
-    payload.categories = 'Uncategorized'
+    // v1.1 API: categories field is a comma-separated slug string
+    payload.categories = categorySlug
     if (article.featuredImageUrl) {
       const hostname = new URL(process.env.WP_URL!).hostname
       const mediaId = await uploadMediaFromUrl(article.featuredImageUrl, hostname, authHeader)
       if (mediaId) payload.featured_image = mediaId
     }
   } else {
+    // wp/v2 REST API: categories field is an array of numeric IDs
+    payload.categories = [categoryId]
     payload.meta = { brand_id: article.brandId }
     if (article.featuredImageUrl) {
       payload.jetpack_featured_media_url = article.featuredImageUrl
     }
   }
+
+  log('info', `[WordPress] Publishing to category: ${categorySlug} (ID ${categoryId}) for brand "${article.brandId}"`)  
 
   let response: Response
   try {
