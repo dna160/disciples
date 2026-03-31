@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid'
 import { prisma } from './prisma'
 import { log } from './logger'
 import { hasBeenSeen, markAsSeen } from './dedup'
-import { fetchAllFeeds, type FeedItem } from './rss-fetcher'
+import { fetchAllFeeds, fetchFeedsForTopic, type FeedItem } from './rss-fetcher'
 import {
   triageArticle,
   draftArticle,
@@ -473,97 +473,239 @@ async function runEditorWorker(
 
     if (firstReview.incompleteInfo) {
       log('warn', `${label} [INCOMPLETE INFO] "${article.title}" — ${firstReview.reason}`)
+      log('warn', `${label} [STATE MACHINE] Starting 4-step Editor↔Investigator↔Copywriter feedback loop`)
       const incBrand = BASE_BRANDS.find((b) => b.id === article.brandId)
 
       if (incBrand) {
         const toneOvInc = settings[incBrand.settingsToneKey]?.trim()
-        const guidelinesInc = toneOvInc ? toneOvInc + '\n\nWrite a complete news article in JSON format: {"title":"...","content":"..."}' : BRAND_GUIDELINES[incBrand.id]
+        const guidelinesInc = toneOvInc
+          ? toneOvInc + '\n\nWrite a complete news article in JSON format: {"title":"...","content":"..."}'
+          : BRAND_GUIDELINES[incBrand.id]
 
         const sourceUrl = (article as any).sourceUrl as string | null
-        let reinvestigated = false
+        // isSynthetic: articles sourced from the SEO-strategist placeholder have no real URL
+        const isSynthetic = !sourceUrl || sourceUrl.startsWith('synthetic://')
 
-        if (sourceUrl) {
-          log('info', `${label} Re-investigating: scraping full content from ${sourceUrl.slice(0, 80)}`)
-          addAgentTask('investigator', `Re-scrape: "${article.title.slice(0, 45)}"`)
-          const scraped = await scrapeArticleContent(sourceUrl, pipelineAbortController?.signal)
-          const originalLen = (articleSourceMap[articleId] || article.content).length
+        // ──────────────────────────────────────────────────────────────────────────
+        // STEP 1 — Investigate Missing Context
+        // The Investigator scrapes the original source URL to find enriched content
+        // that specifically addresses the issues the Editor raised.
+        // ──────────────────────────────────────────────────────────────────────────
+        let step1Succeeded = false
 
-          if (scraped.content.length > originalLen + 200) {
-            const enrichedSource = (articleSourceMap[articleId] || '') + '\n\n[Full article content]:\n' + scraped.content
-            articleSourceMap[articleId] = enrichedSource
-            const reDraft = await draftArticle(enrichedSource, article.brandId, guidelinesInc, pipelineAbortController?.signal)
-            await prisma.article.update({ where: { id: articleId }, data: { title: reDraft.title, content: reDraft.content } })
+        if (!isSynthetic && sourceUrl) {
+          log('info', `${label} [STEP 1] Investigating missing context — scraping: ${sourceUrl.slice(0, 80)}`)
+          const step1TaskId = addAgentTask('investigator', `[Step 1] Investigate: "${article.title.slice(0, 45)}"`)
+          updateAgentTask('investigator', step1TaskId, 'in-progress')
 
-            const reReview = await reviewArticle(reDraft.content, enrichedSource, pipelineAbortController?.signal)
+          try {
+            const scraped = await scrapeArticleContent(sourceUrl, pipelineAbortController?.signal)
+            const originalLen = (articleSourceMap[articleId] || article.content).length
 
-            if (reReview.status === 'PASS') {
-              await prisma.article.update({ where: { id: articleId }, data: { reviewResult: JSON.stringify(reReview) } })
-              
-              const imageQuotaMet = await runImageReview(articleId, reDraft.title, enrichedSource, brandImageCount as number)
-              if (!imageQuotaMet) {
-                await prisma.article.update({ where: { id: articleId }, data: { status: 'Pending Review', reviewResult: JSON.stringify({ status: 'FAIL', reason: 'SYSTEM ERROR: 0 valid images found for this article.' }) } })
-                results.revisedPassIds.push(articleId)
-                updateAgentTask(editorId, taskId, 'done') // image quota not met — editorial outcome, not crash
+            if (scraped.content.length > originalLen + 200) {
+              // Step 1 SUCCESS — enriched context found
+              const enrichedSource = (articleSourceMap[articleId] || '') + '\n\n[Full article content — to address editor notes]:\n' + scraped.content
+              articleSourceMap[articleId] = enrichedSource
+              updateAgentTask('investigator', step1TaskId, 'done')
+
+              // ────────────────────────────────────────────────────────────────────
+              // STEP 3 — Targeted Update
+              // Copywriter updates the draft to specifically fix the Editor's noted
+              // issues, using the newly enriched source — NOT a full rewrite.
+              // ────────────────────────────────────────────────────────────────────
+              log('info', `${label} [STEP 3] Targeted update — Copywriter addressing editor notes: "${firstReview.reason}"`)
+              const step3TaskId = addAgentTask(editorId.replace('editor', 'copywriter-a'), `[Step 3] Targeted fix: "${article.title.slice(0, 45)}"`)
+              updateAgentTask(editorId.replace('editor', 'copywriter-a'), step3TaskId, 'in-progress')
+
+              const revisedForNotes = await reviseArticle(
+                { title: article.title, content: article.content },
+                `IMPORTANT — The editor flagged these specific issues. Address each one using the additional source content below:\n${firstReview.reason}`,
+                enrichedSource,
+                article.brandId,
+                guidelinesInc,
+                pipelineAbortController?.signal
+              )
+              await prisma.article.update({ where: { id: articleId }, data: { title: revisedForNotes.title, content: revisedForNotes.content } })
+              updateAgentTask(editorId.replace('editor', 'copywriter-a'), step3TaskId, 'done')
+
+              // Re-submit to Editor
+              const step3Review = await reviewArticle(revisedForNotes.content, enrichedSource, pipelineAbortController?.signal)
+
+              if (step3Review.status === 'PASS') {
+                await prisma.article.update({ where: { id: articleId }, data: { reviewResult: JSON.stringify(step3Review) } })
+                const imageQuotaMet = await runImageReview(articleId, revisedForNotes.title, enrichedSource, brandImageCount as number)
+                if (!imageQuotaMet) {
+                  await prisma.article.update({ where: { id: articleId }, data: { status: 'Pending Review', reviewResult: JSON.stringify({ status: 'FAIL', reason: 'SYSTEM ERROR: 0 valid images found for this article.' }) } })
+                  results.revisedPassIds.push(articleId)
+                  updateAgentTask(editorId, taskId, 'done')
+                  continue
+                }
+                results.firstPassIds.push(articleId)
+                results.allPassedIds.push(articleId)
+                log('success', `${label} [STEP 3] PASS after targeted update: "${revisedForNotes.title}"`)
+                updateAgentTask(editorId, taskId, 'done')
                 continue
+              } else {
+                // Step 3 failed — pass the targeted draft to the revision loop below
+                step1Succeeded = true
+                lastReview = step3Review
+                currentDraft = { title: revisedForNotes.title, content: revisedForNotes.content }
+                log('info', `${label} [STEP 3] Still failing after targeted update — entering revision loop with enriched source`)
               }
-
-              results.firstPassIds.push(articleId)
-              results.allPassedIds.push(articleId)
-              log('success', `${label} PASS after re-investigation: "${reDraft.title}"`)
-              updateAgentTask(editorId, taskId, 'done')
-              continue
-            } else if (!reReview.incompleteInfo) {
-              log('info', `${label} Re-draft FAIL (non-incomplete) — passing to revision loop`)
-              updateAgentTask(editorId, taskId, 'done')
-              reinvestigated = true
-              lastReview = reReview 
-              currentDraft = { title: reDraft.title, content: reDraft.content } 
+            } else {
+              log('warn', `${label} [STEP 1] Scraped content not significantly richer than original — Step 1 inconclusive`)
+              updateAgentTask('investigator', step1TaskId, 'done')
             }
+          } catch (err) {
+            log('warn', `${label} [STEP 1] Scrape failed: ${err}`)
+            updateAgentTask('investigator', step1TaskId, 'done')
           }
+        } else {
+          log('info', `${label} [STEP 1] Skipped — article uses synthetic/no source URL`)
         }
 
-        if (!reinvestigated) {
-          log('warn', `${label} Source insufficient even after scraping — requesting replacement topic`)
-          addAgentTask('investigator', `Replacement needed: "${article.title.slice(0, 40)}"`)
+        if (!step1Succeeded) {
+          // ──────────────────────────────────────────────────────────────────────
+          // STEP 2 — Re-scrape Alternative
+          // The Investigator could not enrich the original source. Search for a
+          // completely different news source that covers the same franchise/topic,
+          // specifically targeting the gaps the Editor identified.
+          // ──────────────────────────────────────────────────────────────────────
+          log('warn', `${label} [STEP 2] Requesting alternative news source from Investigator`)
+          const step2TaskId = addAgentTask('investigator', `[Step 2] Alt source: "${article.title.slice(0, 40)}"`)
+          updateAgentTask('investigator', step2TaskId, 'in-progress')
 
           const brandNicheForRepl = brandNiches[article.brandId] ?? settings.targetNiche
           const avoidTopics = [(article as any).sourceTitle ?? article.title]
-          const replacementDir = await generateReplacementDirective(article.brandId, brandNicheForRepl, 'short-tail', avoidTopics, pipelineAbortController?.signal)
 
-          if (replacementDir) {
-            const replKey = replacementDir.target_keyword
-            const recentCutoff = new Date(Date.now() - (settings.investigatorDedupeHours ?? 24) * 60 * 60 * 1000).toISOString()
-            const recentRows = await prisma.$queryRawUnsafe<Array<{ title: string }>>(`SELECT title FROM "Article" WHERE brandId = ? AND createdAt >= ? AND status = 'Published' ORDER BY createdAt DESC LIMIT 30`, article.brandId, recentCutoff)
-            const recentHeadlines = recentRows.map((r) => r.title).filter(Boolean)
-            const keepList = await filterDirectivesAgainstPublished([{ keyword: replKey, type: replacementDir.topic_type, angle: replacementDir.angle }], recentHeadlines, pipelineAbortController?.signal)
+          // First try: targeted Serper search for an alt source using the editor's notes
+          // as extra context to narrow the search
+          let altSourceText = ''
+          let altSourceFound = false
 
-            if (keepList.includes(replKey) && !seenDirectiveKeys.has(replKey)) {
-              seenDirectiveKeys.add(replKey)
-              let replSourceText = `Topic: ${replKey}\nAngle: ${replacementDir.angle}`
-              if (process.env.SERPER_API_KEY) {
-                const hits = await searchMultiple(replacementDir.suggested_search_queries, 3)
-                if (hits.length > 0) replSourceText = hits.map((h) => `${h.title}\n${h.snippet}`).join('\n\n')
-              }
-
-              draftCounter.total++
-              const replArticle = await prisma.article.create({
-                data: { id: uuidv4(), cycleId: article.cycleId, brandId: article.brandId, status: 'Drafting', title: `[Drafting] ${replKey}`, content: '', sourceUrl: '', sourceTitle: replKey, featuredImage: null }
-              })
-
-              const replDraft = await draftArticle(replSourceText, article.brandId, guidelinesInc, pipelineAbortController?.signal)
-              await prisma.article.update({ where: { id: replArticle.id }, data: { title: replDraft.title, content: replDraft.content, status: 'Pending Review' } })
-              articleSourceMap[replArticle.id] = replSourceText
-              queue.push(replArticle.id)
-              draftCounter.done++
+          if (process.env.SERPER_API_KEY) {
+            const altQueries = [
+              `${(article as any).sourceTitle ?? article.title} news`,
+              `${firstReview.reason.slice(0, 80)} ${article.brandId}`,
+            ]
+            const hits = await searchMultiple(altQueries, 3)
+            if (hits.length > 0) {
+              altSourceText = hits.map((h) => `${h.title}\n${h.snippet}`).join('\n\n')
+              altSourceFound = true
+              log('info', `${label} [STEP 2] Alternative source found via Serper (${hits.length} results)`)
             }
           }
 
-          await prisma.article.update({
-            where: { id: articleId },
-            data: { status: 'Failed', reviewResult: JSON.stringify({ ...firstReview, reason: 'Source insufficient — replacement queued' }) },
-          })
-          updateAgentTask(editorId, taskId, 'done') // editorial decision to replace — task completed successfully
-          continue
+          // Second try (no Serper): Topic-Driven RSS scan using the article's original
+          // keyword + editor notes as the search seed
+          if (!altSourceFound) {
+            const topicSeed = `${(article as any).sourceTitle ?? article.title}`
+            const rssCustom = {
+              anime: settings.rssSourcesA, toys: settings.rssSourcesB,
+              infotainment: settings.rssSourcesC, game: settings.rssSourcesD, comic: settings.rssSourcesE,
+            }[article.brandId] || ''
+            const rssItems = await fetchFeedsForTopic(topicSeed, brandNicheForRepl, rssCustom, 5)
+            if (rssItems.length > 0) {
+              altSourceText = rssItems.map((i) => `${i.title}\n${i.summary}`).join('\n\n')
+              altSourceFound = true
+              log('info', `${label} [STEP 2] Alternative source found via RSS scan (${rssItems.length} items)`)
+            }
+          }
+
+          // Third try: SEO Strategist generates a fresh replacement directive
+          if (!altSourceFound) {
+            log('warn', `${label} [STEP 2] No alt source via search — asking SEO Strategist for replacement directive`)
+            const replacementDir = await generateReplacementDirective(
+              article.brandId, brandNicheForRepl, 'short-tail', avoidTopics, pipelineAbortController?.signal
+            )
+            if (replacementDir) {
+              if (process.env.SERPER_API_KEY) {
+                const hits = await searchMultiple(replacementDir.suggested_search_queries, 3)
+                if (hits.length > 0) {
+                  altSourceText = hits.map((h) => `${h.title}\n${h.snippet}`).join('\n\n')
+                  altSourceFound = true
+                }
+              }
+              if (!altSourceFound) {
+                altSourceText = `Topic: ${replacementDir.target_keyword}\nAngle: ${replacementDir.angle}`
+                altSourceFound = true
+              }
+            }
+          }
+
+          updateAgentTask('investigator', step2TaskId, altSourceFound ? 'done' : 'failed')
+
+          if (altSourceFound && altSourceText.trim()) {
+            // ──────────────────────────────────────────────────────────────────
+            // STEP 4 — Complete Rewrite
+            // Copywriter completely rewrites the article from scratch using the
+            // new alternative source, and the Editor reviews it fresh.
+            // ──────────────────────────────────────────────────────────────────
+            log('info', `${label} [STEP 4] Complete rewrite from alternative source`)
+            const step4TaskId = addAgentTask(editorId.replace('editor', 'copywriter-a'), `[Step 4] Rewrite: "${article.title.slice(0, 45)}"`)
+            updateAgentTask(editorId.replace('editor', 'copywriter-a'), step4TaskId, 'in-progress')
+
+            articleSourceMap[articleId] = altSourceText
+
+            const rewrittenDraft = await draftArticle(altSourceText, article.brandId, guidelinesInc, pipelineAbortController?.signal)
+            await prisma.article.update({ where: { id: articleId }, data: { title: rewrittenDraft.title, content: rewrittenDraft.content, status: 'Pending Review' } })
+            updateAgentTask(editorId.replace('editor', 'copywriter-a'), step4TaskId, 'done')
+
+            // Editor reviews the completely rewritten article fresh
+            const step4Review = await reviewArticle(rewrittenDraft.content, altSourceText, pipelineAbortController?.signal)
+
+            if (step4Review.status === 'PASS') {
+              await prisma.article.update({ where: { id: articleId }, data: { reviewResult: JSON.stringify(step4Review) } })
+              const imageQuotaMet = await runImageReview(articleId, rewrittenDraft.title, altSourceText, brandImageCount as number)
+              if (!imageQuotaMet) {
+                await prisma.article.update({ where: { id: articleId }, data: { status: 'Pending Review', reviewResult: JSON.stringify({ status: 'FAIL', reason: 'SYSTEM ERROR: 0 valid images found for this article.' }) } })
+                results.revisedPassIds.push(articleId)
+                updateAgentTask(editorId, taskId, 'done')
+                continue
+              }
+              results.firstPassIds.push(articleId)
+              results.allPassedIds.push(articleId)
+              log('success', `${label} [STEP 4] PASS after complete rewrite: "${rewrittenDraft.title}"`)
+              updateAgentTask(editorId, taskId, 'done')
+              continue
+            } else {
+              // Step 4 failed — enter the normal revision loop with the new source
+              lastReview = step4Review
+              currentDraft = { title: rewrittenDraft.title, content: rewrittenDraft.content }
+              log('info', `${label} [STEP 4] Rewrite still failing — entering revision loop with alt source`)
+              // Note: sourceText is still the OLD source; update it to alt source for revision loop
+              // We do this by updating articleSourceMap and using it as the reference in the loop below
+            }
+          } else {
+            // All Step 2 searches exhausted — queue a fully replacement article and fail this one
+            log('warn', `${label} [STEP 2] Fully exhausted — no alternative source found. Queuing replacement topic.`)
+            const brandNicheForFallback = brandNiches[article.brandId] ?? settings.targetNiche
+            const replacementDir = await generateReplacementDirective(
+              article.brandId, brandNicheForFallback, 'short-tail', avoidTopics, pipelineAbortController?.signal
+            )
+
+            if (replacementDir && !seenDirectiveKeys.has(replacementDir.target_keyword)) {
+              seenDirectiveKeys.add(replacementDir.target_keyword)
+              const fallbackSource = `Topic: ${replacementDir.target_keyword}\nAngle: ${replacementDir.angle}`
+              draftCounter.total++
+              const fallbackArticle = await prisma.article.create({
+                data: { id: uuidv4(), cycleId: article.cycleId, brandId: article.brandId, status: 'Drafting', title: `[Drafting] ${replacementDir.target_keyword}`, content: '', sourceUrl: '', sourceTitle: replacementDir.target_keyword, featuredImage: null }
+              })
+              const fallbackDraft = await draftArticle(fallbackSource, article.brandId, guidelinesInc, pipelineAbortController?.signal)
+              await prisma.article.update({ where: { id: fallbackArticle.id }, data: { title: fallbackDraft.title, content: fallbackDraft.content, status: 'Pending Review' } })
+              articleSourceMap[fallbackArticle.id] = fallbackSource
+              queue.push(fallbackArticle.id)
+              draftCounter.done++
+              log('info', `${label} [STEP 2] Replacement article queued: "${replacementDir.target_keyword}"`)
+            }
+
+            await prisma.article.update({
+              where: { id: articleId },
+              data: { status: 'Failed', reviewResult: JSON.stringify({ ...firstReview, reason: '[4-STEP LOOP EXHAUSTED] No valid source found after all fallbacks — replacement queued' }) },
+            })
+            updateAgentTask(editorId, taskId, 'done')
+            continue
+          }
         }
       }
     }
@@ -583,17 +725,19 @@ async function runEditorWorker(
       revisionNum++
       await prisma.article.update({ where: { id: articleId }, data: { status: 'Revising', reviewResult: JSON.stringify(lastReview), revisionCount: revisionNum } })
       
-      const revised = await reviseArticle(currentDraft, lastReview.reason, sourceText, article.brandId, guidelines, pipelineAbortController?.signal)
+      // Use the live source map so Step 4's alt-source rewrite is correctly grounded
+      const activeSource = articleSourceMap[articleId] || sourceText
+      const revised = await reviseArticle(currentDraft, lastReview.reason, activeSource, article.brandId, guidelines, pipelineAbortController?.signal)
       currentDraft = revised
       await prisma.article.update({ where: { id: articleId }, data: { title: revised.title, content: revised.content } })
 
-      const review = await reviewArticle(revised.content, sourceText, pipelineAbortController?.signal)
+      const review = await reviewArticle(revised.content, activeSource, pipelineAbortController?.signal)
       lastReview = review
 
       if (review.status === 'PASS') {
         await prisma.article.update({ where: { id: articleId }, data: { reviewResult: JSON.stringify(review) } })
         
-        const imageQuotaMet = await runImageReview(articleId, revised.title, sourceText, brandImageCount as number)
+        const imageQuotaMet = await runImageReview(articleId, revised.title, activeSource, brandImageCount as number)
         if (!imageQuotaMet) {
           await prisma.article.update({ where: { id: articleId }, data: { status: 'Pending Review', reviewResult: JSON.stringify({ status: 'FAIL', reason: 'SYSTEM ERROR: 0 valid images found for this article.' }) } })
           results.revisedPassIds.push(articleId)
@@ -885,11 +1029,87 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
         }
       }
       log('info', `[INVESTIGATOR] Web search returned ${feedItems.length} raw items across ${directiveHitsMap.size} directives (max ${HITS_PER_DIRECTIVE} per directive)`)
-    } else {
-      // Fallback: RSS feed ingestion
-      if (seoDirectives.length > 0 && !serperKeySet) {
-        log('warn', '[INVESTIGATOR] SEO directives ready but SERPER_API_KEY not set — falling back to RSS')
+    } else if (seoDirectives.length > 0 && !serperKeySet) {
+      // ── Topic-Driven RSS Fetching (Issue 2 Fix B) ──────────────────────────────
+      // Serper is absent but the SEO Strategist produced directives.
+      // Instead of a passive all-feeds dump, actively poll the RSS feeds that are
+      // relevant to each directive's brand niche, searching for topically matching
+      // items. This ensures every quota slot gets a sourced candidate.
+      log('warn', '[INVESTIGATOR] SEO directives ready but SERPER_API_KEY not set — using Topic-Driven RSS Fetching')
+
+      const rssBrandCustomFeeds: Record<string, string> = {
+        anime:        settings.rssSourcesA,
+        toys:         settings.rssSourcesB,
+        infotainment: settings.rssSourcesC,
+        game:         settings.rssSourcesD,
+        comic:        settings.rssSourcesE,
       }
+      const rssBrandNiches: Record<string, string> = {
+        anime:        settings.nicheA || settings.targetNiche,
+        toys:         settings.nicheB || settings.targetNiche,
+        infotainment: settings.nicheC || settings.targetNiche,
+        game:         settings.nicheD || settings.targetNiche,
+        comic:        settings.nicheE || settings.targetNiche,
+      }
+
+      feedItems = []
+      // Fetch per-directive in parallel; Promise.allSettled so one failure doesn't abort the batch
+      const topicFetchResults = await Promise.allSettled(
+        seoDirectives.map(async (directive) => {
+          const brand = directive.brand || 'anime'
+          const topicNiche = rssBrandNiches[brand] || settings.targetNiche
+          const customFeeds = rssBrandCustomFeeds[brand] || ''
+          const taskId = addAgentTask('investigator', `RSS-scan: "${directive.target_keyword}"`)
+          updateAgentTask('investigator', taskId, 'in-progress')
+          let items = await fetchFeedsForTopic(directive.target_keyword, topicNiche, customFeeds, 5)
+
+          // Issue 2 Fix C: If topic RSS scan yields nothing, fall back to Serper-less
+          // keyword search among the suggested_search_queries, then broader niche feeds.
+          if (items.length === 0) {
+            log('warn', `[INVESTIGATOR] Topic RSS scan empty for "${directive.target_keyword}" (${brand}) — broadening to full niche feeds`)
+            addAgentTask('investigator', `Broad RSS fallback: "${directive.target_keyword}"`)
+            // Try each suggested query as keyword against niche feeds
+            for (const q of directive.suggested_search_queries ?? []) {
+              items = await fetchFeedsForTopic(q, topicNiche, customFeeds, 5)
+              if (items.length > 0) break
+            }
+          }
+
+          if (items.length === 0) {
+            log('warn', `[INVESTIGATOR] No RSS source found for "${directive.target_keyword}" — creating synthetic placeholder. Will trigger Investigator re-scrape in Editor loop.`)
+            // Create a minimal synthetic FeedItem so the slot is never dropped.
+            // The Editor's incompleteInfo loop will expand it.
+            items = [{
+              title: directive.target_keyword,
+              summary: directive.angle,
+              link: `synthetic://topic/${encodeURIComponent(directive.target_keyword)}-${Date.now()}`,
+              pubDate: new Date().toISOString(),
+              source: 'SEO Strategist (synthetic)',
+            }]
+          }
+
+          updateAgentTask('investigator', taskId, 'done')
+
+          // Stamp seoContext on all returned items
+          return items.slice(0, 3).map((item) => ({
+            ...item,
+            seoContext: {
+              topicType: directive.topic_type,
+              brand,
+              targetKeyword: directive.target_keyword,
+              angle: directive.angle,
+            },
+          } as FeedItem))
+        })
+      )
+
+      for (const result of topicFetchResults) {
+        if (result.status === 'fulfilled') feedItems.push(...result.value)
+        else log('warn', `[INVESTIGATOR] Topic fetch settled with rejection: ${result.reason}`)
+      }
+      log('info', `[INVESTIGATOR] Topic-Driven RSS Fetching produced ${feedItems.length} items across ${seoDirectives.length} directive(s)`)
+    } else {
+      // Pure RSS fallback (no directives at all)
       feedItems = await fetchAllFeeds({
         nicheA: settings.nicheA,
         nicheB: settings.nicheB,
@@ -1138,9 +1358,12 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
       )
     )
 
-    // Draft all articles in parallel — each completed draft is immediately pushed to editor queue
+    // Draft all articles using Promise.allSettled (Issue 2 Fix D):
+    // Each completed draft is immediately pushed to the editor queue.
+    // Promise.allSettled ensures that one failed topic fetch/draft never
+    // kills the entire batch of 10 articles.
     const draftSemaphore = makeSemaphore(5)
-    await Promise.all(
+    const draftResults = await Promise.allSettled(
       cappedItems.flatMap((item) => {
         const eligibleBrands = BASE_BRANDS.filter((b) => (itemBrandRelevance[item.link] ?? []).includes(b.id))
         return eligibleBrands.map((brand) =>
@@ -1183,7 +1406,7 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
             const fullSourceText = `Title: ${item.title}\n\nSummary: ${item.summary}\n\nSource: ${item.source}\nPublished: ${item.pubDate}${seoBlock}`
 
             log('info', `[COPYWRITER] Drafting for brand "${brand.id}" — "${item.title.slice(0, 60)}"`)
-            let articleId = article.id
+            const articleId = article.id
             try {
               const draft = await draftArticle(fullSourceText, brand.id, guidelines, pipelineAbortController?.signal)
               await prisma.article.update({
@@ -1195,9 +1418,11 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
             } catch (err) {
               log('error', `[COPYWRITER] Draft failed for brand "${brand.id}": ${err}`)
               updateAgentTask(cwId, cwTaskId, 'failed')
+              // Mark article so Editor can detect and skip gracefully
+              await prisma.article.update({ where: { id: articleId }, data: { status: 'Pending Review' } }).catch(() => {})
             }
 
-            // Register source text and push to editor queue immediately
+            // Register source text and push to editor queue immediately (even on draft failure)
             articleSourceMap[articleId] = fullSourceText
             editorQueue.push(articleId)
             draftCounter.done++
@@ -1213,6 +1438,10 @@ export async function runPipelineCycle(isManual: boolean = false): Promise<strin
         )
       })
     )
+    // Log any top-level draft rejections (shouldn't happen — each inner try/catch handles errors)
+    draftResults.forEach((r, i) => {
+      if (r.status === 'rejected') log('error', `[COPYWRITER] Unhandled draft slot ${i} rejected: ${r.reason}`)
+    })
 
     // Wait for all 3 editors to drain the queue
     await Promise.all(editorWorkerPromises)

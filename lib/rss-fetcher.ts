@@ -281,6 +281,66 @@ async function fetchFeedWithTimeout(
   }
 }
 
+// ── Topic-driven RSS scan ──────────────────────────────────────────────────────
+
+/**
+ * Fetch RSS feeds relevant to `brandNiche` and return items whose title or
+ * summary match the given `topicKeyword`. Used by Topic-Driven RSS Fetching
+ * when Serper is unavailable to ensure quota articles are sourced.
+ *
+ * @param topicKeyword  The SEO directive keyword (e.g. "Blue Lock season 2")
+ * @param brandNiche    The brand niche string (e.g. "anime, manga")
+ * @param customFeeds   Optional comma-separated custom RSS URLs (from settings)
+ * @param maxItems      Cap on returned items (default 5)
+ */
+export async function fetchFeedsForTopic(
+  topicKeyword: string,
+  brandNiche: string,
+  customFeeds = '',
+  maxItems = 5
+): Promise<FeedItem[]> {
+  // Resolve which feeds to poll
+  const feedSet = new Map<string, { url: string; name: string }>()
+  if (customFeeds.trim()) {
+    for (const f of customFeeds.split(',').map((s) => s.trim()).filter((s) => s.startsWith('http'))) {
+      feedSet.set(f, { url: f, name: new URL(f).hostname })
+    }
+  }
+  for (const f of resolveFeedsForNiche(brandNiche)) feedSet.set(f.url, f)
+  if (feedSet.size === 0) for (const f of DEFAULT_FEEDS) feedSet.set(f.url, f)
+
+  // Build a keyword token list for matching
+  const keywordTokens = topicKeyword
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((t) => t.length > 2) // skip short stop-words
+
+  const allItems: FeedItem[] = []
+
+  await Promise.allSettled(
+    Array.from(feedSet.values()).map(async (feed) => {
+      try {
+        const items = await fetchFeedWithTimeout(feed.url, feed.name, FEED_TIMEOUT_MS)
+        allItems.push(...items)
+      } catch {
+        // ignore individual feed failures
+      }
+    })
+  )
+
+  // Score items by how many keyword tokens appear in title + summary
+  const scored = allItems
+    .map((item) => {
+      const haystack = `${item.title} ${item.summary}`.toLowerCase()
+      const score = keywordTokens.filter((t) => haystack.includes(t)).length
+      return { item, score }
+    })
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score)
+
+  return scored.slice(0, maxItems).map(({ item }) => item)
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 export interface FetchFeedsOptions {

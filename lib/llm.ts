@@ -463,7 +463,8 @@ export async function deduplicateByFranchise(
 
     const response = await withRetry(() => getClient().messages.create({
       model: MODEL,
-      max_tokens: 512,
+      // Increased from 512 → 4000 to prevent truncated JSON when there are many items
+      max_tokens: 4000,
       temperature: 0.0,
       messages: [
         {
@@ -486,14 +487,19 @@ Respond ONLY with valid JSON listing the IDs to KEEP:
     }, { signal }), signal)
 
     const text = response.content[0].type === 'text' ? response.content[0].text.trim() : ''
-    const jsonText = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
+    // Strip markdown code fences (```json ... ``` or ``` ... ```) before parsing
+    const jsonText = text
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```\s*$/, '')
+      .trim()
     const parsed = JSON.parse(jsonText) as { keep: string[] }
-    if (!Array.isArray(parsed.keep)) throw new Error('Invalid response')
+    if (!Array.isArray(parsed.keep)) throw new Error('Invalid response: keep is not an array')
     return parsed.keep
   } catch (err) {
     if (signal?.aborted) throw err
     log('warn', `[LLM] deduplicateByFranchise failed: ${err} — keeping all items`)
-    return items.map((i) => i.id)
+    // Explicitly return all original IDs so downstream .filter/.map never sees undefined
+    return items.map((i: { id: string; title: string; summary: string }) => i.id)
   }
 }
 
