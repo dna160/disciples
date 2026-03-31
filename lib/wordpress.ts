@@ -1,6 +1,16 @@
 import { config as dotenvConfig } from 'dotenv'
 import path from 'path'
+import { marked } from 'marked'
 import { log } from './logger'
+
+// ── Markdown → HTML safety-net ───────────────────────────────────────────────
+// Even with strict prompts, Claude can occasionally emit Markdown syntax.
+// This function ensures all article content published to WordPress is clean HTML.
+function sanitizeToHtml(content: string): string {
+  // If the content already looks fully HTML (starts with a block-level tag),
+  // still run it through marked — it will pass HTML through untouched.
+  return marked.parse(content) as string
+}
 
 dotenvConfig({ path: path.join(process.cwd(), '.env.local'), override: true })
 dotenvConfig({ path: path.join(process.cwd(), '.env'), override: false })
@@ -123,7 +133,7 @@ function getWPCredentials(): {
 }
 
 /**
- * Upload an image URL to the WordPress.com media library.
+ * Upload an image URL to the WordPress.com media library (wpcom v1.1 API).
  * Returns the media attachment ID, or undefined on failure.
  */
 async function uploadMediaFromUrl(
@@ -153,6 +163,80 @@ async function uploadMediaFromUrl(
 }
 
 /**
+ * Upload an image binary to a self-hosted WordPress site via /wp-json/wp/v2/media.
+ * Fetches the image from the source URL, then POSTs its raw bytes to the WP Media API.
+ * Returns the media attachment ID (for use as `featured_media`), or undefined on failure.
+ *
+ * Why binary upload instead of passing a URL?
+ * The WP REST API v2 /media endpoint does NOT accept image URLs — you must
+ * upload the actual file bytes. Only the wpcom v1.1 sideload endpoint accepts URLs.
+ */
+async function uploadImageBinaryToWordPress(
+  imageUrl: string,
+  wpBaseUrl: string,
+  authHeader: string
+): Promise<number | undefined> {
+  try {
+    // 1. Fetch the image from the external source
+    const imageRes = await fetch(imageUrl)
+    if (!imageRes.ok) {
+      log('warn', `[WordPress] Could not fetch featured image from ${imageUrl.slice(0, 80)} (HTTP ${imageRes.status})`)
+      return undefined
+    }
+
+    const imageBlob = await imageRes.blob()
+
+    // 2. Determine content-type (prefer blob's type; fallback to JPEG)
+    const contentType = imageBlob.type && imageBlob.type !== 'application/octet-stream'
+      ? imageBlob.type
+      : 'image/jpeg'
+
+    // 3. Derive a filename from the URL (strip query strings)
+    const urlPath = new URL(imageUrl).pathname
+    const rawFilename = urlPath.split('/').pop() || `featured-image-${Date.now()}.jpg`
+    const filename = rawFilename.replace(/[^a-zA-Z0-9._-]/g, '_')
+
+    // 4. POST binary to /wp-json/wp/v2/media
+    const mediaEndpoint = `${wpBaseUrl.replace(/\/$/, '')}/wp-json/wp/v2/media`
+    const mediaRes = await fetch(mediaEndpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: authHeader,
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Content-Type': contentType,
+      },
+      body: imageBlob,
+    })
+
+    if (!mediaRes.ok) {
+      const errText = await mediaRes.text().catch(() => '(no body)')
+      log('warn', `[WordPress] Media upload failed (HTTP ${mediaRes.status}): ${errText.slice(0, 200)}`)
+      return undefined
+    }
+
+    const mediaData = (await mediaRes.json()) as { id?: number; source_url?: string }
+    const mediaId = mediaData.id
+
+    if (mediaId) {
+      log('success', `[WordPress] Featured image uploaded — media ID ${mediaId} (${filename})`)
+    }
+    return mediaId
+  } catch (err) {
+    log('warn', `[WordPress] Exception during featured image upload: ${err}`)
+    return undefined
+  }
+}
+
+/**
+ * Extract the first image URL found in a piece of article content.
+ * Handles both Markdown syntax and HTML <img> tags.
+ */
+function extractFirstImageUrl(content: string): string | null {
+  const match = content.match(/!\[.*?\]\((.*?)\)|<img[^>]+src=["'](.*?)["']/)
+  return match ? (match[1] || match[2] || null) : null
+}
+
+/**
  * Publish a new article to WordPress via REST API.
  * Returns the created post ID and link.
  */
@@ -163,31 +247,51 @@ export async function publishToWordPress(article: {
   featuredImageUrl?: string
 }): Promise<WPPublishResult> {
   const { postsEndpoint, authHeader, backend } = getWPCredentials()
+  const siteUrl = (process.env.WP_URL || '').replace(/\/$/, '')
 
   // Resolve category for this brand
   const categoryId   = BRAND_CATEGORY_ID[article.brandId]   ?? 1   // fallback: Uncategorized
   const categorySlug = BRAND_CATEGORY_SLUG[article.brandId] ?? 'uncategorized'
 
+  // ── Safety-net: coerce any residual Markdown to clean HTML ──────────────────
+  // The LLM is instructed to output HTML, but this guarantees clean output
+  // even if Markdown leaks through. marked passes well-formed HTML untouched.
+  const htmlContent = sanitizeToHtml(article.content)
+
+  // ── Attempt to resolve the featured image URL from content ──────────────────
+  // If the caller didn't supply an explicit URL, scan the article content.
+  const resolvedImageUrl =
+    article.featuredImageUrl || extractFirstImageUrl(article.content) || null
+
   const payload: Record<string, unknown> = {
     title: article.title,
-    content: article.content,
+    content: htmlContent,
     status: 'publish',
   }
 
   if (backend === 'wpcom') {
     // v1.1 API: categories field is a comma-separated slug string
     payload.categories = categorySlug
-    if (article.featuredImageUrl) {
-      const hostname = new URL(process.env.WP_URL!).hostname
-      const mediaId = await uploadMediaFromUrl(article.featuredImageUrl, hostname, authHeader)
+    if (resolvedImageUrl) {
+      const hostname = new URL(siteUrl).hostname
+      const mediaId = await uploadMediaFromUrl(resolvedImageUrl, hostname, authHeader)
       if (mediaId) payload.featured_image = mediaId
     }
   } else {
     // wp/v2 REST API: categories field is an array of numeric IDs
     payload.categories = [categoryId]
     payload.meta = { brand_id: article.brandId }
-    if (article.featuredImageUrl) {
-      payload.jetpack_featured_media_url = article.featuredImageUrl
+
+    // Upload image binary to /wp-json/wp/v2/media and attach via `featured_media`.
+    // The wp/v2 API requires an actual media library ID — it does NOT accept raw URLs.
+    if (resolvedImageUrl) {
+      const featuredMediaId = await uploadImageBinaryToWordPress(resolvedImageUrl, siteUrl, authHeader)
+      if (featuredMediaId) {
+        payload.featured_media = featuredMediaId
+        log('info', `[WordPress] Featured media ID ${featuredMediaId} attached to post payload`)
+      } else {
+        log('warn', '[WordPress] Featured image upload failed — post will be published without a featured image')
+      }
     }
   }
 

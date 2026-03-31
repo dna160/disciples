@@ -10,6 +10,61 @@
 
 ---
 
+### v1.7.0 — Featured Image Binary Upload & Markdown Safety-Net
+**Date:** 2026-03-31
+**Branch:** `master`
+
+#### Summary
+Replaced the non-functional `jetpack_featured_media_url` shortcut with a proper two-step featured-image flow for self-hosted WordPress. Added `marked` as a code-level Markdown-to-HTML safety net for all outgoing article content. Both changes target `lib/wordpress.ts` only; no other files are affected.
+
+---
+
+#### Fix: Featured Image — Binary Upload to `/wp-json/wp/v2/media` (`lib/wordpress.ts`)
+
+**Problem:** The `selfhosted` backend was passing `jetpack_featured_media_url` in the post payload. The standard WP REST API v2 ignores this field — it requires a numeric `featured_media` ID sourced from the Media Library. Published posts therefore always had no featured image.
+
+**Fix:** Added `uploadImageBinaryToWordPress()`:
+1. Fetches the image binary from the external source URL.
+2. Derives filename and `Content-Type` from the blob.
+3. POSTs raw bytes to `/wp-json/wp/v2/media` with the correct `Content-Disposition` header.
+4. Returns the `id` from the API response and attaches it as `featured_media` in the post payload.
+
+Also added `extractFirstImageUrl()` — scans both Markdown `![](url)` syntax and HTML `<img src="...">` tags — so a featured image is set even if the caller does not supply `featuredImageUrl` explicitly.
+
+**New functions added to `lib/wordpress.ts`:**
+
+| Function | Role |
+|---|---|
+| `uploadImageBinaryToWordPress(imageUrl, wpBaseUrl, authHeader)` | Fetch + upload image binary, return WP Media ID |
+| `extractFirstImageUrl(content)` | Find first image URL from Markdown or HTML content |
+
+**Files changed:** `lib/wordpress.ts`
+
+---
+
+#### Feature: Markdown → HTML Safety-Net via `marked` (`lib/wordpress.ts`)
+
+**Problem:** Despite strict HTML-only prompts, the LLM occasionally emits Markdown formatting (bold `**text**`, headers `## heading`, etc.) which renders as raw text in WordPress Classic Editor / Gutenberg HTML mode.
+
+**Fix:** Added `sanitizeToHtml()` using the `marked` library, called on `article.content` before the payload is assembled. `marked.parse()` converts any residual Markdown to well-formed HTML and passes through content that is already fully HTML without modification.
+
+**Dependency added:** `marked` + `@types/marked` (npm install)
+
+```typescript
+import { marked } from 'marked'
+
+function sanitizeToHtml(content: string): string {
+  return marked.parse(content) as string
+}
+
+// Applied before building the WP post payload:
+const htmlContent = sanitizeToHtml(article.content)
+```
+
+**Files changed:** `package.json` (added `marked`), `lib/wordpress.ts`
+
+---
+
 ### v1.6.0 — WordPress Migration, Brand Categories & Developer Docs
 **Date:** 2026-03-31
 **Branch:** `master`
