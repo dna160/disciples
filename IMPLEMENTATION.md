@@ -10,6 +10,83 @@
 
 ---
 
+### v1.6.0 — WordPress Migration, Brand Categories & Developer Docs
+**Date:** 2026-03-31
+**Branch:** `master`
+**Commit:** `abaa6dd`
+
+#### Summary
+Migrated the publish target from WordPress.com (`aryamedia1.wordpress.com`) to a self-hosted Hostinger instance. Added automatic WordPress category assignment keyed to each brand. Created `SYNTAX_INDEX.md` — a comprehensive developer reference — and embedded a quick-reference section in `IMPLEMENTATION.md`.
+
+---
+
+#### Change: WordPress Target — Hostinger Self-Hosted (`lib/wordpress.ts`, `.env.local`)
+
+**Previous target:** `https://aryamedia1.wordpress.com` (WordPress.com, OAuth2 Bearer)
+**New target:** `https://hotpink-dogfish-392833.hostingersite.com` (self-hosted, Basic Auth)
+
+`getWPCredentials()` automatically detects the backend from `WP_URL`:
+- Contains `wordpress.com` → **wpcom** path (REST v1.1 + `WPCOM_ACCESS_TOKEN`)
+- Contains `/api/mock-wordpress` → **mock** path (local dev)
+- Everything else → **selfhosted** path (`WP_USERNAME` + `WP_APP_PASSWORD`, Basic Auth, `wp/v2` REST API)
+
+**Connection test result (2026-03-31):**
+```
+✅ Auth — GET /wp-json/wp/v2/users/me → logged in as "johnson leonardi" (ID 6)
+✅ Publish — POST /wp-json/wp/v2/posts → Post ID 645 created (draft)
+```
+
+**Files changed:** `.env.local`, `lib/wordpress.ts`
+
+---
+
+#### Feature: Brand Category Auto-Assignment (`lib/wordpress.ts`)
+
+Every article published by the pipeline is now automatically filed under the correct WordPress category for its brand. Category IDs were fetched live from the site and hardcoded as two constants:
+
+| Constant | Used by | Format |
+|---|---|---|
+| `BRAND_CATEGORY_ID` | `selfhosted` backend (`wp/v2`) | `Record<string, number>` → passed as `categories: [id]` |
+| `BRAND_CATEGORY_SLUG` | `wpcom` backend (v1.1 API) | `Record<string, string>` → passed as `categories: 'slug'` |
+
+**Category map (verified 2026-03-31):**
+
+| Brand ID | Category Name | WP Category ID |
+|---|---|---|
+| `anime` | Anime | `11` |
+| `toys` | Toys | `12` |
+| `infotainment` | Infotainment | `10` |
+| `game` | Game | `13` |
+| `comic` | Comic | `14` |
+| `event` | Event | `17` |
+
+Falls back to `Uncategorized` (ID `1`) for any unknown `brandId`.
+
+**Pipeline log output per publish:**
+```
+[WordPress] Publishing to category: anime (ID 11) for brand "anime"
+```
+
+**Test result:** Draft post ID `646` confirmed assigned to category `11` (Anime) via `GET /wp-json/wp/v2/posts/646`.
+
+**Files changed:** `lib/wordpress.ts` (lines 53–72, 143–168)
+
+> ⚠️ If a new WordPress category is added, update both `BRAND_CATEGORY_ID` and `BRAND_CATEGORY_SLUG` in `lib/wordpress.ts`. To refresh IDs from the live site:
+> ```
+> GET /wp-json/wp/v2/categories?per_page=50
+> ```
+
+---
+
+#### Docs: SYNTAX_INDEX & Developer Reference
+
+- Created [`SYNTAX_INDEX.md`](./SYNTAX_INDEX.md) — 650+ line developer reference covering every constant, type, function, component, hook, API endpoint, and naming rule in the codebase.
+- Added **Developer Reference** section to this file (`IMPLEMENTATION.md`) with brand map, type quick-reference, core function surface tables, frontend API client usage, and the 5 production rules.
+
+**Files added/changed:** `SYNTAX_INDEX.md` (new), `IMPLEMENTATION.md`
+
+---
+
 ### v1.5.0 — Pipeline Fidelity, Image Magic-Bytes & LLM Quality  
 **Date:** 2026-03-30  
 **Branch:** `master`  

@@ -776,6 +776,27 @@ interface WPPublishResult {
   id: string      // WordPress post ID
   url: string     // Published article URL
 }
+```
+
+#### Category ID Map (live site — verified 2026-03-31)
+
+| Constant | Key | Value | WordPress Category |
+|---|---|---|---|
+| `BRAND_CATEGORY_ID` | `'anime'` | `11` | Anime |
+| `BRAND_CATEGORY_ID` | `'toys'` | `12` | Toys |
+| `BRAND_CATEGORY_ID` | `'infotainment'` | `10` | Infotainment |
+| `BRAND_CATEGORY_ID` | `'game'` | `13` | Game |
+| `BRAND_CATEGORY_ID` | `'comic'` | `14` | Comic |
+| `BRAND_CATEGORY_ID` | `'event'` | `17` | Event |
+
+> ⚠️ If you add a new WordPress category, add its ID here **and** in `BRAND_CATEGORY_SLUG`. The ID is used for the `wp/v2` REST API (`selfhosted`); the slug is used for the WordPress.com v1.1 API (`wpcom`).
+
+```typescript
+// Self-hosted backend: categories = [categoryId] (numeric array)
+const BRAND_CATEGORY_ID: Record<string, number>
+
+// WordPress.com backend: categories = 'slug-string' (comma-separated)
+const BRAND_CATEGORY_SLUG: Record<string, string>
 
 // Simple delay (no abort support)
 function wpSleep(ms: number): Promise<void>
